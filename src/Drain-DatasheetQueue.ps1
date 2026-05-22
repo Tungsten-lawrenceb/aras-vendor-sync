@@ -147,7 +147,9 @@ function Get-XxHash32Decimal {
         $v1 = [uint32]((([uint64]$P1 + [uint64]$P2) -band $mask))
         $v2 = $P2
         $v3 = [uint32]0
-        $v4 = [uint32](([uint64]0 - [uint64]$P1) -band $mask)
+        # v4 = -P1 mod 2^32. PS rejects [uint64](0L - P1) because the
+        # intermediate is signed-negative. Compute via 2^32 explicitly.
+        $v4 = [uint32](([uint64]0x100000000 - [uint64]$P1) -band $mask)
         while (($len - $i) -ge 16) {
             $v1 = _round $v1 ([BitConverter]::ToUInt32($Data, $i))
             $v2 = _round $v2 ([BitConverter]::ToUInt32($Data, $i + 4))
