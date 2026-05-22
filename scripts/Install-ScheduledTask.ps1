@@ -53,7 +53,10 @@ if (-not (Test-Path $ConfigPath)) {
 
 # Build the arguments. PowerShell needs to be invoked with -File and the
 # -ConfigPath flag passed through.
-$psExe = (Get-Command pwsh -ErrorAction SilentlyContinue) ?? (Get-Command powershell)
+# Prefer pwsh (PowerShell 7) if installed; fall back to Windows PowerShell 5.1.
+# `??` (null-coalescing) is PS 7+ only — write it the PS 5.1-compatible way.
+$psExe = Get-Command pwsh -ErrorAction SilentlyContinue
+if (-not $psExe) { $psExe = Get-Command powershell }
 $action = New-ScheduledTaskAction `
     -Execute $psExe.Source `
     -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$ScriptPath`" -ConfigPath `"$ConfigPath`""
