@@ -245,7 +245,7 @@ function Get-DigiKeyPricing {
             return _extract $resp.Product
         }
     } catch {
-        # Non-2xx — try keyword search as a fallback (handles
+        # Non-2xx - try keyword search as a fallback (handles
         # "Duplicate Products found for X" 404s).
     }
     try {
@@ -314,19 +314,19 @@ foreach ($row in $rows) {
     $mpId = $row.'related_id@aras.id'
     $mfrPn = $row.'related_id@aras.keyed_name'
     if (-not $mfrPn) {
-        Write-Log SKIP "row=$($row.id) — no Mfr PN on related_id"
+        Write-Log SKIP "row=$($row.id) - no Mfr PN on related_id"
         $skipped++
         continue
     }
     try {
         $price = Get-DigiKeyPricing -MfrPn $mfrPn
     } catch {
-        Write-Log ERROR "$mfrPn — DigiKey error: $($_.Exception.Message)"
+        Write-Log ERROR "$mfrPn - DigiKey error: $($_.Exception.Message)"
         $failed++
         continue
     }
     if (-not $price -or $price.unit_price -eq $null) {
-        Write-Log SKIP "$mfrPn — no pricing in DK response"
+        Write-Log SKIP "$mfrPn - no pricing in DK response"
         $skipped++
         continue
     }
@@ -354,7 +354,7 @@ foreach ($row in $rows) {
             $mfrPn, $price.digikey_part_number, $price.unit_price, $delta, $price.product_status)
         $ok++
     } catch {
-        Write-Log ERROR "$mfrPn — PATCH failed: $($_.Exception.Message)"
+        Write-Log ERROR "$mfrPn - PATCH failed: $($_.Exception.Message)"
         $failed++
     }
 }
@@ -371,7 +371,7 @@ $eventId = if ($failed -gt 0) { 2002 } else { 1001 }
 Write-EventLogSafe -Message "aras-vendor-sync: $summary" -EntryType $entryType -EventId $eventId
 
 if ($DryRun) {
-    Write-Log INFO "DryRun=true — no rows were patched."
+    Write-Log INFO "DryRun=true - no rows were patched."
 }
 
 exit ([int]($failed -gt 0))

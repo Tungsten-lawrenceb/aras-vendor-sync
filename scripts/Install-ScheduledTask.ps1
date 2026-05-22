@@ -48,13 +48,13 @@ if (-not (Test-Path $ScriptPath)) {
     throw "Script not found: $ScriptPath"
 }
 if (-not (Test-Path $ConfigPath)) {
-    Write-Warning "Config not found at $ConfigPath — create it before the next scheduled run."
+    Write-Warning "Config not found at $ConfigPath - create it before the next scheduled run."
 }
 
 # Build the arguments. PowerShell needs to be invoked with -File and the
 # -ConfigPath flag passed through.
 # Prefer pwsh (PowerShell 7) if installed; fall back to Windows PowerShell 5.1.
-# `??` (null-coalescing) is PS 7+ only — write it the PS 5.1-compatible way.
+# `??` (null-coalescing) is PS 7+ only - write it the PS 5.1-compatible way.
 $psExe = Get-Command pwsh -ErrorAction SilentlyContinue
 if (-not $psExe) { $psExe = Get-Command powershell }
 $action = New-ScheduledTaskAction `
