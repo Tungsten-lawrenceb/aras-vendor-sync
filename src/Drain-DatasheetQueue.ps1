@@ -340,21 +340,40 @@ function Get-ManufacturerPartItemNumber {
 function Update-Request {
     param([string]$RowId, [hashtable]$Body)
     if ($DryRun) { return }
-    # Filter out null values: PS's ConvertTo-Json emits them as JSON nulls,
-    # but Aras's OData layer has been observed to mis-parse PATCH bodies
-    # containing nulls (XML translation step rejects with "hexadecimal
-    # value 0x00, is an invalid character"). Caller signals "clear field"
-    # by passing an empty string or omitting the key.
+    # Filter out null values to keep the JSON clean.
     $clean = @{}
     foreach ($k in $Body.Keys) {
         $v = $Body[$k]
         if ($null -ne $v) { $clean[$k] = $v }
     }
     $json = $clean | ConvertTo-Json -Compress
-    Invoke-RestMethod -Method Patch `
-        -Uri "$odataBase/DatasheetFetchRequest('$RowId')" `
-        -Headers ($arasHeaders + @{ 'Content-Type' = 'application/json' }) `
-        -Body $json -TimeoutSec 30 | Out-Null
+
+    # PS 5.1's Invoke-RestMethod has been observed to corrupt PATCH bodies
+    # to specific Aras endpoints (Aras complains about 0x00 chars in the
+    # body even though our JSON is pure ASCII — likely a UTF-16 encoding
+    # quirk in the cmdlet). curl.exe sends bytes verbatim and works.
+    $url = "$odataBase/DatasheetFetchRequest('$RowId')"
+    $tmp = New-TemporaryFile
+    try {
+        # Write the JSON as raw bytes (ASCII compatible UTF-8 without BOM).
+        [System.IO.File]::WriteAllBytes(
+            $tmp.FullName,
+            [System.Text.UTF8Encoding]::new($false).GetBytes($json))
+        $authHeader = "Authorization: Bearer $arasToken"
+        $ctHeader = 'Content-Type: application/json'
+        $code = curl.exe -s -o NUL -w '%{http_code}' -X PATCH $url `
+            -H $authHeader -H $ctHeader `
+            --data-binary "@$($tmp.FullName)"
+        if ($code -notmatch '^2\d\d$') {
+            # Re-run to capture the body for diagnostics
+            $resp = curl.exe -s -X PATCH $url `
+                -H $authHeader -H $ctHeader `
+                --data-binary "@$($tmp.FullName)"
+            throw "PATCH $url -> HTTP $code: $resp"
+        }
+    } finally {
+        Remove-Item $tmp.FullName -ErrorAction SilentlyContinue
+    }
 }
 
 function New-ManufacturerPartFile {
