@@ -340,9 +340,24 @@ function Get-ManufacturerPartItemNumber {
 function Update-Request {
     param([string]$RowId, [hashtable]$Body)
     if ($DryRun) { return }
-    Invoke-RestMethod -Method Patch -Uri "$odataBase/DatasheetFetchRequest('$RowId')" `
+    # Filter out null values: PS's ConvertTo-Json emits them as JSON nulls,
+    # but Aras's OData layer has been observed to mis-parse PATCH bodies
+    # containing nulls (XML translation step rejects with "hexadecimal
+    # value 0x00, is an invalid character"). Caller signals "clear field"
+    # by passing an empty string or omitting the key.
+    $clean = @{}
+    foreach ($k in $Body.Keys) {
+        $v = $Body[$k]
+        if ($null -ne $v) { $clean[$k] = $v }
+    }
+    $json = $clean | ConvertTo-Json -Compress
+    # Use Out-Null instead of returning so the cmdlet output doesn't pollute
+    # the caller's pipeline.
+    $uri = "$odataBase/DatasheetFetchRequest('$RowId')"
+    $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+    Invoke-RestMethod -Method Patch -Uri $uri `
         -Headers ($arasHeaders + @{ 'Content-Type' = 'application/json' }) `
-        -Body ($Body | ConvertTo-Json -Compress) -TimeoutSec 30 | Out-Null
+        -Body $bodyBytes -TimeoutSec 30 | Out-Null
 }
 
 function New-ManufacturerPartFile {
