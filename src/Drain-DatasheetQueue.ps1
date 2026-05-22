@@ -318,8 +318,12 @@ function Download-Pdf {
     $bytes = $resp.Content
     if (-not $bytes -or $bytes.Length -lt 8) { throw "empty response" }
     $head = ($bytes[0..7] -join ' ')
-    $magic = [System.Text.Encoding]::ASCII.GetString($bytes, 0, [Math]::Min(8, $bytes.Length))
-    $magic = $magic.TrimStart("`0`r`n`t ", [char]0xFEFF, [char]0xEF, [char]0xBB, [char]0xBF)
+    # PS's TrimStart wants a char[] (not a string + char args). Defensively
+    # check the leading bytes for any BOM or whitespace before looking for
+    # the %PDF magic.
+    $magic = [System.Text.Encoding]::ASCII.GetString($bytes, 0, [Math]::Min(16, $bytes.Length))
+    $trim = [char[]](0x00, 0x09, 0x0A, 0x0D, 0x20, 0xFEFF, 0xEF, 0xBB, 0xBF)
+    $magic = $magic.TrimStart($trim)
     if (-not $magic.StartsWith('%PDF')) {
         throw "URL did not return a PDF (Content-Type=$($resp.Headers.'Content-Type'); first 8 bytes: $head)"
     }
@@ -346,12 +350,21 @@ function Update-Request {
         $v = $Body[$k]
         if ($null -ne $v) { $clean[$k] = $v }
     }
-    $json = $clean | ConvertTo-Json -Compress
+    # Strip XML-illegal control chars (notably 0x00) from string values.
+    # Aras's OData layer XML-translates the JSON body internally and chokes
+    # on any 0x00 byte; sanitize here so a Python-style error message
+    # containing   in `last_error` doesn't crash the patch.
+    $sanitized = @{}
+    foreach ($k in $clean.Keys) {
+        $v = $clean[$k]
+        if ($v -is [string]) {
+            $sanitized[$k] = ($v -replace "[\x00-\x08\x0B\x0C\x0E-\x1F]", '?')
+        } else {
+            $sanitized[$k] = $v
+        }
+    }
+    $json = $sanitized | ConvertTo-Json -Compress
 
-    # PS 5.1's Invoke-RestMethod has been observed to corrupt PATCH bodies
-    # to specific Aras endpoints (Aras complains about 0x00 chars in the
-    # body even though our JSON is pure ASCII — likely a UTF-16 encoding
-    # quirk in the cmdlet). curl.exe sends bytes verbatim and works.
     $url = "$odataBase/DatasheetFetchRequest('$RowId')"
     $tmp = New-TemporaryFile
     try {
