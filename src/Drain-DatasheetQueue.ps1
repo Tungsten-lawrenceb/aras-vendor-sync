@@ -243,7 +243,7 @@ function Invoke-VaultCommitFile {
     }
     $resp = Invoke-WebRequest -Method Post -Uri "$vaultBase/vault.CommitTransaction" `
         -Headers $headers -ContentType "multipart/mixed; boundary=$boundary" `
-        -Body $body -TimeoutSec 60
+        -Body $body -TimeoutSec 60 -UseBasicParsing
     # Aras returns 204 + Location: .../File('FILEID') OR 200 with no Location.
     # In either case the File id is the one we passed in.
     return $FileId
@@ -314,7 +314,7 @@ function Download-Pdf {
         'Accept-Language' = 'en-US,en;q=0.9'
     }
     $resp = Invoke-WebRequest -Method Get -Uri $url -Headers $browserHeaders `
-        -TimeoutSec 60 -MaximumRedirection 10
+        -TimeoutSec 60 -MaximumRedirection 10 -UseBasicParsing
     $bytes = $resp.Content
     if (-not $bytes -or $bytes.Length -lt 8) { throw "empty response" }
     $head = ($bytes[0..7] -join ' ')
