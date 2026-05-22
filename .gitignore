@@ -1,0 +1,15 @@
+# local secrets — config lives outside the repo in C:\ProgramData\AarasVendorSync\
+config.json
+*.local.*
+*.bak
+*.log
+
+# editor cruft
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+Thumbs.db
+.DS_Store

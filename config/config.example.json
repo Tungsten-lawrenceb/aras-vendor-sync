@@ -1,0 +1,16 @@
+{
+  "_comment": "Copy to C:\\ProgramData\\AarasVendorSync\\config.json and fill in. Vendor credentials are NOT here — they live in MPN_API_Config rows inside Aras. This file holds only what's needed to authenticate as the Aras service user.",
+  "aras": {
+    "url": "https://plm.robotics-centre.com/InnovatorServer",
+    "database": "InnovatorSolutions",
+    "username": "aras-vendor-sync",
+    "password_md5": "REPLACE_WITH_MD5_HEX_OF_THE_SERVICE_USER_PASSWORD"
+  },
+  "log": {
+    "directory": "C:\\ProgramData\\AarasVendorSync\\logs",
+    "event_log_source": "AarasVendorSync"
+  },
+  "limits": {
+    "max_rows_per_run": 500
+  }
+}
