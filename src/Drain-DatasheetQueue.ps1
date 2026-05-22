@@ -369,7 +369,7 @@ function Update-Request {
             $resp = curl.exe -s -X PATCH $url `
                 -H $authHeader -H $ctHeader `
                 --data-binary "@$($tmp.FullName)"
-            throw "PATCH $url -> HTTP $code: $resp"
+            throw "PATCH $url -> HTTP ${code}: $resp"
         }
     } finally {
         Remove-Item $tmp.FullName -ErrorAction SilentlyContinue
