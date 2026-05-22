@@ -107,7 +107,7 @@ $dkToken = $dkTok.access_token
 $dkHeaders = @{ Authorization = "Bearer $dkToken"; 'X-DIGIKEY-Client-Id' = $dkCfg.client_id; Accept = 'application/json' }
 Write-Log OK "Digi-Key token acquired"
 
-# Resolve service user's default vault id (REST API §5.1)
+# Resolve service user's default vault id (REST API section 5.1)
 $me = Invoke-RestMethod -Uri "$odataBase/User?`$filter=login_name eq '$($config.aras.username)'&`$select=id,default_vault&`$top=1" `
     -Headers $arasHeaders -TimeoutSec 30
 $vaultId = $me.value[0].'default_vault@aras.id'
