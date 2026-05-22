@@ -118,67 +118,82 @@ Write-Log INFO "Default vault: $vaultId"
 # xxHash32 (decimal string) - vault chunk-integrity header
 # ----------------------------------------------------------------------------
 
-# PowerShell 5.1-compatible xxHash32 implementation. Returns the hash as
-# an unsigned-32 integer; the vault wants it formatted as a decimal
-# string. Mirrors the Python worker's xxhash.xxh32(data).intdigest().
+# xxHash32 via inline-compiled C#. PowerShell's bitwise semantics for
+# uint32 are subtly broken (signed shifts, intermediate overflows, scope
+# capture in scriptblocks) and a pure-PS implementation kept tripping
+# on edge cases. C# handles unsigned arithmetic natively.
+#
+# Add-Type compiles on first invocation (~100ms) and is cached after.
+if (-not ('AraSync.XxHash32' -as [type])) {
+    Add-Type -Language CSharp -TypeDefinition @'
+namespace AraSync {
+    using System;
+    public static class XxHash32 {
+        const uint P1 = 0x9E3779B1U;
+        const uint P2 = 0x85EBCA77U;
+        const uint P3 = 0xC2B2AE3DU;
+        const uint P4 = 0x27D4EB2FU;
+        const uint P5 = 0x165667B1U;
+        static uint Round(uint acc, uint input) {
+            unchecked {
+                acc += input * P2;
+                acc = (acc << 13) | (acc >> 19);
+                acc *= P1;
+                return acc;
+            }
+        }
+        static uint RotL(uint v, int n) {
+            return (v << n) | (v >> (32 - n));
+        }
+        public static uint Compute(byte[] data) {
+            unchecked {
+                int len = data.Length;
+                int i = 0;
+                uint h;
+                if (len >= 16) {
+                    uint v1 = P1 + P2;
+                    uint v2 = P2;
+                    uint v3 = 0;
+                    uint v4 = 0U - P1;
+                    while (len - i >= 16) {
+                        v1 = Round(v1, BitConverter.ToUInt32(data, i));
+                        v2 = Round(v2, BitConverter.ToUInt32(data, i + 4));
+                        v3 = Round(v3, BitConverter.ToUInt32(data, i + 8));
+                        v4 = Round(v4, BitConverter.ToUInt32(data, i + 12));
+                        i += 16;
+                    }
+                    h = RotL(v1, 1) + RotL(v2, 7) + RotL(v3, 12) + RotL(v4, 18);
+                } else {
+                    h = P5;
+                }
+                h += (uint)len;
+                while (len - i >= 4) {
+                    h += BitConverter.ToUInt32(data, i) * P3;
+                    h = RotL(h, 17) * P4;
+                    i += 4;
+                }
+                while (i < len) {
+                    h += (uint)data[i] * P5;
+                    h = RotL(h, 11) * P1;
+                    i += 1;
+                }
+                h ^= h >> 15;
+                h *= P2;
+                h ^= h >> 13;
+                h *= P3;
+                h ^= h >> 16;
+                return h;
+            }
+        }
+    }
+}
+'@
+}
+
 function Get-XxHash32Decimal {
     param([byte[]]$Data)
-    $P1 = [uint32]2654435761; $P2 = [uint32]2246822519
-    $P3 = [uint32]3266489917; $P4 = [uint32]668265263; $P5 = [uint32]374761393
-    $mask = [uint64]0xFFFFFFFF
-
-    function _mul([uint32]$a, [uint32]$b) {
-        return [uint32]((([uint64]$a * [uint64]$b) -band $script:mask))
-    }
-    function _rotl([uint32]$v, [int]$n) {
-        return [uint32]((($v -shl $n) -bor ($v -shr (32 - $n))) -band $script:mask)
-    }
-    function _round([uint32]$acc, [uint32]$input) {
-        $acc = [uint32](([uint64]$acc + ([uint64](_mul $input $script:P2))) -band $script:mask)
-        return _mul (_rotl $acc 13) $script:P1
-    }
-
-    $script:mask = $mask
-    $script:P1 = $P1; $script:P2 = $P2
-
-    $len = $Data.Length
-    $i = 0
-    if ($len -ge 16) {
-        $v1 = [uint32]((([uint64]$P1 + [uint64]$P2) -band $mask))
-        $v2 = $P2
-        $v3 = [uint32]0
-        # v4 = -P1 mod 2^32. PS rejects [uint64](0L - P1) because the
-        # intermediate is signed-negative. Compute via 2^32 explicitly.
-        $v4 = [uint32](([uint64]0x100000000 - [uint64]$P1) -band $mask)
-        while (($len - $i) -ge 16) {
-            $v1 = _round $v1 ([BitConverter]::ToUInt32($Data, $i))
-            $v2 = _round $v2 ([BitConverter]::ToUInt32($Data, $i + 4))
-            $v3 = _round $v3 ([BitConverter]::ToUInt32($Data, $i + 8))
-            $v4 = _round $v4 ([BitConverter]::ToUInt32($Data, $i + 12))
-            $i += 16
-        }
-        $h = [uint32]((([uint64](_rotl $v1 1) + [uint64](_rotl $v2 7) + [uint64](_rotl $v3 12) + [uint64](_rotl $v4 18)) -band $mask))
-    } else {
-        $h = $P5
-    }
-    $h = [uint32](([uint64]$h + [uint64]$len) -band $mask)
-    while (($len - $i) -ge 4) {
-        $w = [BitConverter]::ToUInt32($Data, $i)
-        $h = [uint32](([uint64]$h + [uint64](_mul $w $P3)) -band $mask)
-        $h = _mul (_rotl $h 17) $P4
-        $i += 4
-    }
-    while ($i -lt $len) {
-        $h = [uint32](([uint64]$h + [uint64](_mul ([uint32]$Data[$i]) $P5)) -band $mask)
-        $h = _mul (_rotl $h 11) $P1
-        $i += 1
-    }
-    $h = [uint32]($h -bxor ($h -shr 15))
-    $h = _mul $h $P2
-    $h = [uint32]($h -bxor ($h -shr 13))
-    $h = _mul $h $P3
-    $h = [uint32]($h -bxor ($h -shr 16))
-    return $h.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+    return [AraSync.XxHash32]::Compute($Data).ToString(
+        [System.Globalization.CultureInfo]::InvariantCulture)
 }
 
 # ----------------------------------------------------------------------------
