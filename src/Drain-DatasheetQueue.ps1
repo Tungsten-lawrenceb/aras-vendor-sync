@@ -205,11 +205,32 @@ function New-ArasId {
 }
 
 function Invoke-VaultBegin {
-    $resp = Invoke-RestMethod -Method Post -Uri "$vaultBase/vault.BeginTransaction" `
+    # Use Invoke-WebRequest so we can read the raw response body. The
+    # transactionId comes back as JSON but Invoke-RestMethod has been
+    # observed to leave it empty in PS 5.1 — likely a content-encoding
+    # parse quirk. Parse manually.
+    $resp = Invoke-WebRequest -Method Post -Uri "$vaultBase/vault.BeginTransaction" `
         -Headers ($arasHeaders + @{ VAULTID = $vaultId }) `
         -ContentType 'application/octet-stream' -Body ([byte[]]@()) `
-        -TimeoutSec 30
-    return $resp.transactionId
+        -TimeoutSec 30 -UseBasicParsing
+    $body = $resp.Content
+    if ($body -is [byte[]]) {
+        # Direct byte path: decode as UTF-8 and strip the BOM if present.
+        $body = [System.Text.Encoding]::UTF8.GetString($body)
+    } else {
+        # Invoke-WebRequest returns Content as a string already decoded —
+        # but in Windows-1252 / Latin-1 if no charset was specified.
+        # Re-round-trip through bytes to recover the true UTF-8 string.
+        $latin1 = [System.Text.Encoding]::GetEncoding(28591)
+        $body = [System.Text.Encoding]::UTF8.GetString($latin1.GetBytes($body))
+    }
+    # Now the BOM (if any) is the U+FEFF Zero-Width No-Break Space char.
+    $body = $body.TrimStart([char[]](0xFEFF, 0x00, 0x09, 0x0A, 0x0D, 0x20))
+    $j = $body | ConvertFrom-Json
+    $txn = $j.transactionId
+    if (-not $txn) { $txn = $j.transaction_id }
+    if (-not $txn) { throw "vault.BeginTransaction returned no transactionId: $body" }
+    return $txn
 }
 
 function Invoke-VaultUploadChunk {
@@ -234,7 +255,9 @@ function Invoke-VaultCommitFile {
     # IIS-rooted sub-request path: /InnovatorServer/server/odata/File
     $parsed = [uri]"$odataBase/File"
     $subPath = $parsed.AbsolutePath
-    $host = $parsed.Host
+    # NOTE: `$host` is a read-only PS built-in (the host application).
+    # Use a different variable name here.
+    $hostName = $parsed.Host
     $payload = @{
         '@odata.type' = '#File'
         id            = $FileId
@@ -247,7 +270,7 @@ function Invoke-VaultCommitFile {
         "Content-Transfer-Encoding: binary`r`n" +
         "`r`n" +
         "POST $subPath HTTP/1.1`r`n" +
-        "Host: $host`r`n" +
+        "Host: $hostName`r`n" +
         "Content-Type: application/json`r`n" +
         "`r`n" +
         "$payload`r`n" +
@@ -268,7 +291,9 @@ function Invoke-VaultCommitFile {
 
 function Upload-FileToVault {
     param([byte[]]$Bytes, [string]$Filename)
+    Write-Log INFO "vault: Begin (size=$($Bytes.Length))"
     $txnId = Invoke-VaultBegin
+    Write-Log OK   "vault: txn=$txnId"
     $fileId = New-ArasId
     $chunkSize = 16MB
     $offset = 0
@@ -276,11 +301,14 @@ function Upload-FileToVault {
         $end = [Math]::Min($offset + $chunkSize, $Bytes.Length)
         $chunk = New-Object byte[] ($end - $offset)
         [Array]::Copy($Bytes, $offset, $chunk, 0, $end - $offset)
+        Write-Log INFO "vault: UploadFile chunk offset=$offset len=$($chunk.Length)"
         Invoke-VaultUploadChunk -TxnId $txnId -FileId $fileId -Filename $Filename `
             -Chunk $chunk -Offset $offset -Total $Bytes.Length
         $offset = $end
     }
+    Write-Log INFO "vault: CommitTransaction fileId=$fileId"
     Invoke-VaultCommitFile -TxnId $txnId -FileId $fileId -Filename $Filename -Size $Bytes.Length | Out-Null
+    Write-Log OK   "vault: committed"
     return $fileId
 }
 
@@ -481,7 +509,19 @@ foreach ($req in $queued.value) {
         Write-Log OK "$mfrPn - attached $($bytes.Length) bytes (file=$fileId)"
         $ok++
     } catch {
-        $msg = "$($_.Exception.GetType().Name): $($_.Exception.Message)"
+        $exType = $_.Exception.GetType().Name
+        $exMsg = $_.Exception.Message
+        # Try to get the inner response body for HTTP errors
+        $detail = ''
+        try {
+            if ($_.Exception.Response) {
+                $sr = New-Object IO.StreamReader($_.Exception.Response.GetResponseStream())
+                $detail = $sr.ReadToEnd()
+                $sr.Close()
+            }
+        } catch {}
+        $msg = "$exType`: $exMsg"
+        if ($detail) { $msg += " body=$($detail.Substring(0, [Math]::Min($detail.Length, 400)))" }
         Update-Request -RowId $rowId -Body @{ request_state = 'Failed'; last_error = $msg }
         Write-Log ERROR "$mfrPn - $msg"
         $failed++
