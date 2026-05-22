@@ -34,7 +34,7 @@
 
 [CmdletBinding()]
 param(
-    [string]$ScriptPath = (Join-Path (Split-Path $PSScriptRoot -Parent) 'src\Refresh-VendorPricing.ps1'),
+    [string]$ScriptPath,
     [string]$ConfigPath = "$env:ProgramData\AarasVendorSync\config.json",
     [string]$TaskName   = 'aras-vendor-sync',
     [string]$At         = '03:00',
@@ -43,6 +43,16 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Resolve the default ScriptPath inside the body so $PSScriptRoot is
+# guaranteed populated. (PS sets $PSScriptRoot when the script is
+# invoked via -File, but param-default expressions can evaluate before
+# that binding in some invocation contexts.)
+if (-not $ScriptPath) {
+    $here = $PSScriptRoot
+    if (-not $here) { $here = Split-Path $MyInvocation.MyCommand.Path -Parent }
+    $ScriptPath = Join-Path (Split-Path $here -Parent) 'src\Refresh-VendorPricing.ps1'
+}
 
 if (-not (Test-Path $ScriptPath)) {
     throw "Script not found: $ScriptPath"
