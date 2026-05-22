@@ -351,13 +351,10 @@ function Update-Request {
         if ($null -ne $v) { $clean[$k] = $v }
     }
     $json = $clean | ConvertTo-Json -Compress
-    # Use Out-Null instead of returning so the cmdlet output doesn't pollute
-    # the caller's pipeline.
-    $uri = "$odataBase/DatasheetFetchRequest('$RowId')"
-    $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($json)
-    Invoke-RestMethod -Method Patch -Uri $uri `
+    Invoke-RestMethod -Method Patch `
+        -Uri "$odataBase/DatasheetFetchRequest('$RowId')" `
         -Headers ($arasHeaders + @{ 'Content-Type' = 'application/json' }) `
-        -Body $bodyBytes -TimeoutSec 30 | Out-Null
+        -Body $json -TimeoutSec 30 | Out-Null
 }
 
 function New-ManufacturerPartFile {
