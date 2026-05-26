@@ -37,6 +37,9 @@ param(
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+# Shared per-vendor throttle (Mouser 30/min, DigiKey ~100/min defaults).
+. "$PSScriptRoot\Vendor-Throttle.ps1"
+
 # ----------------------------------------------------------------------------
 # Config + logging (mirrors Refresh-VendorPricing.ps1)
 # ----------------------------------------------------------------------------
@@ -106,6 +109,27 @@ $dkTok = Invoke-RestMethod -Method Post -Uri "$dkEndpoint/v1/oauth2/token" `
 $dkToken = $dkTok.access_token
 $dkHeaders = @{ Authorization = "Bearer $dkToken"; 'X-DIGIKEY-Client-Id' = $dkCfg.client_id; Accept = 'application/json' }
 Write-Log OK "Digi-Key token acquired"
+
+# Mouser uses a single API key (in `client_secret`), no OAuth.
+$msCfg = $mpn.value | Where-Object { $_.vendor -eq 'Mouser' } | Select-Object -First 1
+$msEndpoint = $null
+$msApiKey = $null
+if ($msCfg -and $msCfg.client_secret) {
+    $msApiKey = $msCfg.client_secret
+    $msEndpoint = ($msCfg.default_endpoint -as [string])
+    if (-not $msEndpoint) { $msEndpoint = 'https://api.mouser.com' }
+    $msEndpoint = $msEndpoint.TrimEnd('/')
+    Write-Log OK "Mouser API key loaded"
+} else {
+    Write-Log INFO "Mouser API key not configured (fallback disabled)"
+}
+
+# Known Vendor item ids (matches src/aras_mcp/importers/datasheets.py VENDOR_IDS).
+# Used by Upsert-VendorPart as the source_id of the Vendor Part rel row.
+$VendorIds = @{
+    DigiKey = 'E94E47CFF55149C9B16BBD2939D861C9'
+    Mouser  = '947C86F817C2454D9C3AE7062D3E0669'
+}
 
 # Resolve service user's default vault id (REST API section 5.1)
 $me = Invoke-RestMethod -Uri "$odataBase/User?`$filter=login_name eq '$($config.aras.username)'&`$select=id,default_vault&`$top=1" `
@@ -313,34 +337,297 @@ function Upload-FileToVault {
 }
 
 # ----------------------------------------------------------------------------
-# Digi-Key lookup (mirrors Refresh-VendorPricing.ps1)
+# MPN variants — loose matching helper
 # ----------------------------------------------------------------------------
 
-function Get-DigiKeyDatasheetUrl {
-    param([string]$MfrPn)
-    $encoded = [System.Uri]::EscapeDataString($MfrPn)
+# Yield up to N variants of an MPN ordered most-likely-first. Each
+# variant is a string we'll try against DK and Mouser. The first
+# variant is always the original MPN.
+function Get-MpnVariants {
+    param([string]$Mpn, [int]$Max = 6)
+    # In-line dedup: collect into a list, skip duplicates as we go.
+    # (Prior version used a nested helper that captured $script:seen,
+    # which leaked state across calls and broke variant generation on
+    # subsequent invocations within the same script.)
+    $out = New-Object 'System.Collections.Generic.List[string]'
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+    $candidates = @()
+    $candidates += $Mpn
+    # 1) Drop a trailing reel/packaging code: comma-or-space + alnum tail
+    #    e.g. "PZU16BL,315" -> "PZU16BL", "ABM8-272-T3" -> "ABM8-272"
+    if ($Mpn -match '^(.+),([A-Za-z0-9]+)$') { $candidates += $Matches[1] }
+    if ($Mpn -match '^(.+)-T\d?$')           { $candidates += $Matches[1] }
+    if ($Mpn -match '^(.+)-TR$')             { $candidates += $Matches[1] }
+    if ($Mpn -match '^(.+)#TRPBF$')          { $candidates += $Matches[1] }
+    if ($Mpn -match '^(.+)#PBF$')            { $candidates += $Matches[1] }
+    if ($Mpn -match '^(.+)TR$')              { $candidates += $Matches[1] }
+    # 2) Compress whitespace and try collapsed form
+    $collapsed = ($Mpn -replace '\s+', '')
+    if ($collapsed -ne $Mpn)                 { $candidates += $collapsed }
+    # 3) Drop trailing space + token (e.g. "W25Q128JVSIQ TR" -> "W25Q128JVSIQ")
+    if ($Mpn -match '^(.+)\s+\S+$')          { $candidates += $Matches[1] }
+    foreach ($c in $candidates) {
+        if ([string]::IsNullOrWhiteSpace($c)) { continue }
+        $t = $c.Trim()
+        if ($seen.Add($t)) { $out.Add($t) }
+        if ($out.Count -ge $Max) { break }
+    }
+    return $out.ToArray()
+}
+
+# ----------------------------------------------------------------------------
+# Digi-Key lookup — returns datasheet URL AND pricing.
+# Tries the exact MPN first, then a few loose variants. For each variant
+# we attempt ProductDetails (fast path), then keyword search.
+# ----------------------------------------------------------------------------
+
+function _ExtractDkPricing {
+    param($Product)
+    # ProductDetails shape: Product.ProductVariations[].StandardPricing[]
+    # Note: in V4 the top-level Product.DigiKeyProductNumber is EMPTY —
+    # the real SKU is on each variation. So we also return dk_pn from
+    # whichever variation gave us the best price.
+    if (-not $Product) { return $null }
+    $variations = $Product.ProductVariations
+    if (-not $variations) { return $null }
+    $bestPrice = $null
+    $bestCurr  = $null
+    $bestMoq   = $null
+    $bestDkPn  = $null
+    foreach ($v in $variations) {
+        $standardPricing = $v.StandardPricing
+        if (-not $standardPricing) { continue }
+        # Find lowest break-quantity row with a non-null UnitPrice.
+        $rows = @($standardPricing | Where-Object { $_.UnitPrice -ne $null })
+        if (-not $rows) { continue }
+        $row = $rows | Sort-Object BreakQuantity | Select-Object -First 1
+        $up = [decimal]$row.UnitPrice
+        $moq = $v.MinimumOrderQuantity
+        if (-not $moq) { $moq = $row.BreakQuantity }
+        if ($null -eq $bestPrice -or $up -lt $bestPrice) {
+            $bestPrice = $up
+            $bestCurr  = if ($Product.PricingCurrency) { $Product.PricingCurrency } else { 'USD' }
+            $bestMoq   = $moq
+            $bestDkPn  = $v.DigiKeyProductNumber
+        }
+    }
+    if ($null -eq $bestPrice) { return $null }
+    return @{
+        unit_price    = $bestPrice
+        currency      = $bestCurr
+        min_order_qty = $bestMoq
+        dk_pn         = $bestDkPn
+    }
+}
+
+function _DkProductDetails {
+    param([string]$Mpn)
+    $encoded = [System.Uri]::EscapeDataString($Mpn)
+    Wait-ApiInterval -Api 'DigiKey'
     try {
         $resp = Invoke-RestMethod -Method Get -Uri "$dkEndpoint/products/v4/search/$encoded/productdetails" `
             -Headers $dkHeaders -TimeoutSec 30
-        if ($resp.Product -and $resp.Product.DatasheetUrl) {
-            return @{ url = $resp.Product.DatasheetUrl; dk_pn = $resp.Product.DigiKeyProductNumber }
-        }
-    } catch { }
-    # Keyword fallback
+        return $resp.Product
+    } catch { return $null }
+}
+
+function _DkKeywordSearch {
+    param([string]$Mpn)
+    Wait-ApiInterval -Api 'DigiKey'
     try {
-        $kwBody = @{ Keywords = $MfrPn; Limit = 5; Offset = 0 } | ConvertTo-Json -Compress
+        $kwBody = @{ Keywords = $Mpn; Limit = 10; Offset = 0 } | ConvertTo-Json -Compress
         $kw = Invoke-RestMethod -Method Post -Uri "$dkEndpoint/products/v4/search/keyword" `
             -Headers ($dkHeaders + @{ 'Content-Type' = 'application/json' }) -Body $kwBody -TimeoutSec 30
     } catch { return $null }
     if (-not $kw.Products) { return $null }
-    $targetNorm = ($MfrPn -replace '[^A-Za-z0-9]', '').ToUpperInvariant()
-    $exact = $kw.Products | Where-Object {
-        ($_.ManufacturerProductNumber -replace '[^A-Za-z0-9]', '').ToUpperInvariant() -eq $targetNorm
+    $targetNorm = ($Mpn -replace '[^A-Za-z0-9]', '').ToUpperInvariant()
+    # STRICT: only accept an exact alnum-normalized match against the
+    # requested MPN. Earlier versions fell back to "first hit with
+    # datasheet" / "first hit", which produced bogus Vendor Part rows
+    # for non-distributor MPNs (e.g. Tungsten custom PNs, hobby brands).
+    # If none of the keyword results actually equal the MPN we asked
+    # for, return null and let the caller move on.
+    $exact = @($kw.Products | Where-Object {
+            ($_.ManufacturerProductNumber -replace '[^A-Za-z0-9]', '').ToUpperInvariant() -eq $targetNorm
+        })
+    if ($exact.Count -gt 0) { return $exact[0] }
+    return $null
+}
+
+function Get-DigiKeyLookup {
+    param([string]$MfrPn)
+    $variants = Get-MpnVariants -Mpn $MfrPn
+    foreach ($v in $variants) {
+        $vNorm = ($v -replace '[^A-Za-z0-9]', '').ToUpperInvariant()
+        $prod = _DkProductDetails -Mpn $v
+        # ProductDetails can return a "close" match that isn't actually
+        # the MPN we asked for. Verify the returned MfrPN alnum-equals
+        # our variant before trusting it. Same strictness used by the
+        # keyword search.
+        if ($prod) {
+            $rNorm = ($prod.ManufacturerProductNumber -replace '[^A-Za-z0-9]', '').ToUpperInvariant()
+            if ($rNorm -ne $vNorm) { $prod = $null }
+        }
+        if (-not $prod -or -not $prod.DatasheetUrl) {
+            # ProductDetails miss — try keyword search (also strict)
+            $prod = _DkKeywordSearch -Mpn $v
+        }
+        if (-not $prod) { continue }
+        $url = $prod.DatasheetUrl
+        $pricing = _ExtractDkPricing -Product $prod
+        # V4: top-level DigiKeyProductNumber is usually empty. Prefer the
+        # SKU from the lowest-priced variation; fall back to any
+        # variation's SKU; finally fall back to the empty top-level field.
+        $dkPn = $null
+        if ($pricing) { $dkPn = $pricing.dk_pn }
+        if (-not $dkPn -and $prod.ProductVariations -and $prod.ProductVariations.Count -gt 0) {
+            $dkPn = $prod.ProductVariations[0].DigiKeyProductNumber
+        }
+        if (-not $dkPn) { $dkPn = $prod.DigiKeyProductNumber }
+        if (-not $url -and -not $pricing -and -not $dkPn) { continue }
+        $out = @{
+            url           = $url
+            dk_pn         = $dkPn
+            matched_mpn   = $prod.ManufacturerProductNumber
+            used_variant  = $v
+        }
+        if ($pricing) {
+            $out.unit_price    = $pricing.unit_price
+            $out.currency      = $pricing.currency
+            $out.min_order_qty = $pricing.min_order_qty
+        }
+        return $out
     }
-    $best = $exact | Where-Object { $_.DatasheetUrl -and $_.DatasheetUrl.Contains('mm.digikey.com') } | Select-Object -First 1
-    if (-not $best) { $best = $exact | Where-Object { $_.DatasheetUrl } | Select-Object -First 1 }
-    if (-not $best) { $best = $kw.Products | Where-Object { $_.DatasheetUrl } | Select-Object -First 1 }
-    if ($best) { return @{ url = $best.DatasheetUrl; dk_pn = $best.DigiKeyProductNumber } }
+    return $null
+}
+
+# ----------------------------------------------------------------------------
+# Mouser lookup — single API key, partnumber search.
+# Returns datasheet URL AND pricing (first non-null PriceBreaks entry).
+# ----------------------------------------------------------------------------
+
+# Mouser Availability is sometimes "In Stock 1234" or just "1234".
+# Pull the leading integer; null on anything we can't parse.
+function _MouserParseAvailability {
+    param([string]$S)
+    if ([string]::IsNullOrWhiteSpace($S)) { return $null }
+    $m = [regex]::Match($S, '\d+')
+    if (-not $m.Success) { return $null }
+    $n = 0
+    if ([int]::TryParse($m.Value, [ref]$n)) { return $n }
+    return $null
+}
+
+function _MouserParseMoney {
+    param([string]$S)
+    if ([string]::IsNullOrWhiteSpace($S)) { return $null }
+    $m = [regex]::Match($S, '[\d.,]+')
+    if (-not $m.Success) { return $null }
+    $raw = $m.Value
+    # If both comma and period appear, the rightmost is the decimal sep.
+    if ($raw.Contains(',') -and $raw.Contains('.')) {
+        if ($raw.LastIndexOf(',') -gt $raw.LastIndexOf('.')) {
+            $raw = $raw.Replace('.', '').Replace(',', '.')
+        } else {
+            $raw = $raw.Replace(',', '')
+        }
+    } elseif ($raw.Contains(',') -and -not $raw.Contains('.')) {
+        $raw = $raw.Replace(',', '.')
+    }
+    $d = 0
+    if ([decimal]::TryParse($raw, [System.Globalization.NumberStyles]::Any,
+            [System.Globalization.CultureInfo]::InvariantCulture, [ref]$d)) {
+        return $d
+    }
+    return $null
+}
+
+function _MouserSearch {
+    param([string]$Mpn)
+    if (-not $msApiKey) { return $null }
+    $body = @{
+        SearchByPartRequest = @{
+            mouserPartNumber  = $Mpn
+            partSearchOptions = 'string'
+        }
+    } | ConvertTo-Json -Compress -Depth 4
+    Wait-ApiInterval -Api 'Mouser'
+    try {
+        $resp = Invoke-RestMethod -Method Post `
+            -Uri "$msEndpoint/api/v1/search/partnumber?apiKey=$msApiKey" `
+            -Headers @{ Accept = 'application/json' } `
+            -ContentType 'application/json' `
+            -Body $body -TimeoutSec 30
+    } catch { return $null }
+    if (-not $resp -or -not $resp.SearchResults) { return $null }
+    if ($resp.Errors -and $resp.Errors.Count -gt 0) { return $null }
+    $parts = $resp.SearchResults.Parts
+    if (-not $parts) { return $null }
+    return $parts
+}
+
+function Get-MouserLookup {
+    param([string]$MfrPn)
+    if (-not $msApiKey) { return $null }
+    $variants = Get-MpnVariants -Mpn $MfrPn
+    foreach ($v in $variants) {
+        $parts = _MouserSearch -Mpn $v
+        if (-not $parts) { continue }
+        $targetNorm = ($v -replace '[^A-Za-z0-9]', '').ToUpperInvariant()
+        # STRICT: only accept an exact alnum-normalized match. Mouser
+        # search returns substring matches (e.g. "23165" -> "517-2316-
+        # 5211TB"), and the older "first hit" / "startswith" fallbacks
+        # created bogus Vendor Part rows.
+        $exact = @($parts | Where-Object {
+                ($_.ManufacturerPartNumber -replace '[^A-Za-z0-9]', '').ToUpperInvariant() -eq $targetNorm
+            })
+        $chosen = $null
+        # Prefer an exact-match hit that also has a datasheet
+        foreach ($p in $exact) {
+            if ($p.DataSheetUrl) { $chosen = $p; break }
+        }
+        # Otherwise any exact-match hit, even without a datasheet
+        if (-not $chosen -and $exact.Count -gt 0) { $chosen = $exact[0] }
+        if (-not $chosen) { continue }
+
+        # Pull pricing from PriceBreaks: first non-null entry.
+        $unitPrice = $null
+        $currency  = $null
+        $minOrder  = $null
+        if ($chosen.PriceBreaks) {
+            foreach ($pb in $chosen.PriceBreaks) {
+                $up = _MouserParseMoney $pb.Price
+                if ($null -ne $up) {
+                    $unitPrice = $up
+                    $currency  = $pb.Currency
+                    break
+                }
+            }
+        }
+        $moq = 0
+        if (-not [int]::TryParse(($chosen.Min -as [string]), [ref]$moq)) { $moq = $null }
+
+        $url = $chosen.DataSheetUrl
+        if (-not $url -and $null -eq $unitPrice) { continue }
+        $availability = _MouserParseAvailability $chosen.Availability
+        $productStatus = $chosen.LifecycleStatus
+        $out = @{
+            url           = $url
+            mouser_pn     = $chosen.MouserPartNumber
+            matched_mpn   = $chosen.ManufacturerPartNumber
+            used_variant  = $v
+        }
+        if ($null -ne $unitPrice) {
+            $out.unit_price = $unitPrice
+            $out.currency   = $currency
+        }
+        if ($moq) { $out.min_order_qty = $moq }
+        if ($null -ne $availability) { $out.availability = $availability }
+        if (-not [string]::IsNullOrWhiteSpace($productStatus)) {
+            $out.product_status = $productStatus
+        }
+        return $out
+    }
     return $null
 }
 
@@ -449,6 +736,21 @@ function New-ManufacturerPartFile {
     return $resp.id
 }
 
+# Returns $true iff this MP already has at least one Manufacturer Part File
+# rel — i.e. a datasheet (or any file) is already attached. We use this to
+# avoid re-downloading + re-attaching duplicate datasheets when the queue
+# is re-run for the same MP (which has happened repeatedly during pricing
+# backfills). Note: this is a coarser check than New-ManufacturerPartFile,
+# which only deduplicates exact (mp, file) pairs — useless when the new
+# upload generates a fresh File id even for the same PDF content.
+function Test-MpHasDatasheet {
+    param([string]$MpId)
+    $resp = Invoke-RestMethod `
+        -Uri "$odataBase/Manufacturer%20Part%20File?`$filter=source_id eq '$MpId'&`$select=id&`$top=1" `
+        -Headers $arasHeaders -TimeoutSec 30
+    return ($resp.value -and $resp.value.Count -gt 0)
+}
+
 function Convert-MpnToSafeFilename {
     param([string]$Mpn)
     $cleaned = ([char[]]$Mpn | ForEach-Object {
@@ -457,12 +759,97 @@ function Convert-MpnToSafeFilename {
     return "$cleaned.pdf"
 }
 
+# Create-or-update a Vendor Part rel row carrying the vendor SKU and pricing.
+# Mirrors src/aras_mcp/importers/datasheets.py:_upsert_vendor_part.
+# Idempotent on (source_id=vendor, related_id=mp).
+function Upsert-VendorPart {
+    param(
+        [Parameter(Mandatory)] [string]$Vendor,        # 'DigiKey' / 'Mouser'
+        [Parameter(Mandatory)] [string]$MpId,
+        [Parameter(Mandatory)] [string]$CatalogNumber, # vendor SKU
+        $UnitPrice     = $null,
+        [string]$Currency       = $null,
+        $MinOrderQty   = $null,
+        $Availability  = $null,
+        [string]$ProductStatus  = $null
+    )
+    if ($DryRun) { return }
+    $vendorId = $VendorIds[$Vendor]
+    if (-not $vendorId) {
+        Write-Log WARN "Upsert-VendorPart: unknown vendor '$Vendor'"
+        return
+    }
+    if ([string]::IsNullOrWhiteSpace($CatalogNumber)) {
+        return  # No SKU to anchor on
+    }
+    $catTrim = $CatalogNumber.Substring(0, [Math]::Min($CatalogNumber.Length, 32))
+    $nowIso  = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss')
+
+    $existing = Invoke-RestMethod `
+        -Uri "$odataBase/Vendor%20Part?`$filter=source_id eq '$vendorId' and related_id eq '$MpId'&`$select=id,catalog_number,unit_price,currency,min_order_qty,availability,product_status&`$top=1" `
+        -Headers $arasHeaders -TimeoutSec 30
+
+    if ($existing.value -and $existing.value.Count -gt 0) {
+        $row = $existing.value[0]
+        $relId = $row.id
+        $patch = @{}
+        if ($row.catalog_number -ne $catTrim) { $patch.catalog_number = $catTrim }
+        if ($null -ne $UnitPrice) {
+            $patch.unit_price = $UnitPrice
+            $patch.pricing_updated_on = $nowIso
+        }
+        if ($Currency -and $Currency -ne $row.currency) {
+            $patch.currency = $Currency.Substring(0, [Math]::Min($Currency.Length, 8))
+        }
+        if ($null -ne $MinOrderQty -and $MinOrderQty -ne $row.min_order_qty) {
+            $patch.min_order_qty = $MinOrderQty
+        }
+        if ($null -ne $Availability -and $Availability -ne $row.availability) {
+            $patch.availability = $Availability
+        }
+        if (-not [string]::IsNullOrWhiteSpace($ProductStatus) -and $ProductStatus -ne $row.product_status) {
+            $patch.product_status = $ProductStatus.Substring(0, [Math]::Min($ProductStatus.Length, 32))
+        }
+        if ($patch.Count -gt 0) {
+            $body = $patch | ConvertTo-Json -Compress
+            Invoke-RestMethod -Method Patch -Uri "$odataBase/Vendor%20Part('$relId')" `
+                -Headers ($arasHeaders + @{ 'Content-Type' = 'application/json' }) `
+                -Body $body -TimeoutSec 30 | Out-Null
+        }
+        return $relId
+    }
+
+    $body = @{
+        source_id      = $vendorId
+        related_id     = $MpId
+        catalog_number = $catTrim
+    }
+    if ($null -ne $UnitPrice) {
+        $body.unit_price = $UnitPrice
+        $body.pricing_updated_on = $nowIso
+    }
+    if ($Currency) {
+        $body.currency = $Currency.Substring(0, [Math]::Min($Currency.Length, 8))
+    }
+    if ($null -ne $MinOrderQty) { $body.min_order_qty = $MinOrderQty }
+    if ($null -ne $Availability) { $body.availability = $Availability }
+    if (-not [string]::IsNullOrWhiteSpace($ProductStatus)) {
+        $body.product_status = $ProductStatus.Substring(0, [Math]::Min($ProductStatus.Length, 32))
+    }
+
+    $json = $body | ConvertTo-Json -Compress
+    $resp = Invoke-RestMethod -Method Post -Uri "$odataBase/Vendor%20Part" `
+        -Headers ($arasHeaders + @{ 'Content-Type' = 'application/json' }) `
+        -Body $json -TimeoutSec 30
+    return $resp.id
+}
+
 # ----------------------------------------------------------------------------
 # Main loop
 # ----------------------------------------------------------------------------
 
 $queued = Invoke-RestMethod `
-    -Uri "$odataBase/DatasheetFetchRequest?`$filter=request_state eq 'Queued'&`$select=id,manufacturer_part_id,vendor,attempt_count&`$top=$Limit&`$orderby=created_on" `
+    -Uri "$odataBase/DatasheetFetchRequest?`$filter=request_state eq 'Queued'&`$select=id,manufacturer_part_id,vendor,attempt_count,file_id&`$top=$Limit&`$orderby=created_on" `
     -Headers $arasHeaders -TimeoutSec 30
 Write-Log INFO "Queued rows to drain: $($queued.value.Count)"
 
@@ -474,6 +861,7 @@ foreach ($req in $queued.value) {
     $mpId = $req.'manufacturer_part_id@aras.id'
     $mfrPn = $req.'manufacturer_part_id@aras.keyed_name'
     $attempts = [int]$req.attempt_count
+    $existingFileId = $req.file_id  # set on requests that already attached a PDF in a prior run
 
     try {
         Update-Request -RowId $rowId -Body @{
@@ -489,24 +877,98 @@ foreach ($req in $queued.value) {
         if (-not $mfrPn) { throw "no item_number on MP $mpId" }
 
         Write-Log INFO "Processing $mfrPn (req=$rowId)"
-        $lookup = Get-DigiKeyDatasheetUrl -MfrPn $mfrPn
-        if (-not $lookup -or -not $lookup.url) {
-            Update-Request -RowId $rowId -Body @{ request_state = 'Failed'; last_error = 'no datasheet URL from Digi-Key' }
-            Write-Log SKIP "$mfrPn - no DK datasheet"
-            $skipped++; continue
+
+        # Always query BOTH vendors so each gets its own Vendor Part row
+        # with its own SKU + pricing. Mouser is not a "fallback" — it's a
+        # parallel source. The downstream MP.unit_price rollup takes
+        # min() across both, so the cheaper vendor wins the cost field.
+        $dkLookup = Get-DigiKeyLookup -MfrPn $mfrPn
+        $msLookup = $null
+        if ($msApiKey) {
+            $msLookup = Get-MouserLookup -MfrPn $mfrPn
         }
-        $bytes = Download-Pdf -Url $lookup.url
-        $filename = Convert-MpnToSafeFilename -Mpn $mfrPn
-        $fileId = Upload-FileToVault -Bytes $bytes -Filename $filename
-        New-ManufacturerPartFile -MpId $mpId -FileId $fileId | Out-Null
+
+        $datasheetUrl = $null
+        $datasheetSrc = $null   # 'DigiKey' or 'Mouser'
+        if ($dkLookup -and $dkLookup.url) {
+            $datasheetUrl = $dkLookup.url
+            $datasheetSrc = 'DigiKey'
+        } elseif ($msLookup -and $msLookup.url) {
+            $datasheetUrl = $msLookup.url
+            $datasheetSrc = 'Mouser'
+        }
+
+        # Upsert Vendor Part rows for every vendor that gave us a SKU
+        # (with or without pricing). Pricing-only writes are useful for the
+        # cost rollup; SKU-only writes give engineers a stable catalog link.
+        $vendorWritten = 0
+        if ($dkLookup -and $dkLookup.dk_pn) {
+            Upsert-VendorPart -Vendor 'DigiKey' -MpId $mpId `
+                -CatalogNumber $dkLookup.dk_pn `
+                -UnitPrice $dkLookup.unit_price `
+                -Currency  $dkLookup.currency `
+                -MinOrderQty $dkLookup.min_order_qty | Out-Null
+            $vendorWritten++
+        }
+        if ($msLookup -and $msLookup.mouser_pn) {
+            Upsert-VendorPart -Vendor 'Mouser' -MpId $mpId `
+                -CatalogNumber $msLookup.mouser_pn `
+                -UnitPrice     $msLookup.unit_price `
+                -Currency      $msLookup.currency `
+                -MinOrderQty   $msLookup.min_order_qty `
+                -Availability  $msLookup.availability `
+                -ProductStatus $msLookup.product_status | Out-Null
+            $vendorWritten++
+        }
+
+        # Datasheet attach. Skip if this request already has file_id set
+        # (re-queued for price-only retry) OR if no datasheet URL came back.
+        $fileId = $existingFileId
+        if (-not $datasheetUrl) {
+            if ($vendorWritten -eq 0) {
+                Update-Request -RowId $rowId -Body @{
+                    request_state = 'Failed'
+                    last_error    = 'no datasheet URL or SKU from DigiKey/Mouser'
+                }
+                Write-Log SKIP "$mfrPn - no vendor match"
+                $skipped++; continue
+            }
+            # Pricing/SKU only — still a useful Completed.
+            Update-Request -RowId $rowId -Body @{
+                request_state = 'Completed'
+                completed_on  = $nowIso
+                last_error    = $null
+            }
+            Write-Log OK "$mfrPn - vendor row(s) created (no datasheet)"
+            $ok++; continue
+        }
+
+        # Avoid downloading + attaching a duplicate datasheet. Aras tracks
+        # the MP↔File attachment, so check that first; only fetch if the
+        # MP truly has no file yet AND this request row doesn't already
+        # carry a file_id from a prior partial run.
+        if (-not $fileId -and (Test-MpHasDatasheet -MpId $mpId)) {
+            Write-Log INFO "$mfrPn - already has a datasheet attached; skipping download"
+        } elseif (-not $fileId) {
+            $bytes = Download-Pdf -Url $datasheetUrl
+            $filename = Convert-MpnToSafeFilename -Mpn $mfrPn
+            $fileId = Upload-FileToVault -Bytes $bytes -Filename $filename
+            New-ManufacturerPartFile -MpId $mpId -FileId $fileId | Out-Null
+        } else {
+            Write-Log INFO "$mfrPn - reusing existing file_id $existingFileId"
+        }
         Update-Request -RowId $rowId -Body @{
             request_state = 'Completed'
             file_id       = $fileId
-            datasheet_url = $lookup.url
+            datasheet_url = $datasheetUrl
             completed_on  = $nowIso
             last_error    = $null
         }
-        Write-Log OK "$mfrPn - attached $($bytes.Length) bytes (file=$fileId)"
+        if ($null -ne $dkLookup.unit_price -or $null -ne $msLookup.unit_price) {
+            Write-Log OK "$mfrPn - datasheet + pricing ($datasheetSrc)"
+        } else {
+            Write-Log OK "$mfrPn - datasheet only ($datasheetSrc, no pricing)"
+        }
         $ok++
     } catch {
         $exType = $_.Exception.GetType().Name

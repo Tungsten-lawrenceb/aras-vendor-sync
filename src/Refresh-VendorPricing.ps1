@@ -41,6 +41,9 @@ param(
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+# Per-vendor throttle so the weekly walk doesn't hammer DK above its rate.
+. "$PSScriptRoot\Vendor-Throttle.ps1"
+
 # ----------------------------------------------------------------------------
 # Config + logging
 # ----------------------------------------------------------------------------
@@ -239,6 +242,7 @@ function Get-DigiKeyPricing {
     # ProductDetails (exact MPN). 404 + "Duplicate Products" needs keyword fallback.
     $encoded = [System.Uri]::EscapeDataString($MfrPn)
     $url = "$dkEndpoint/products/v4/search/$encoded/productdetails"
+    Wait-ApiInterval -Api 'DigiKey'
     try {
         $resp = Invoke-RestMethod -Method Get -Uri $url -Headers $dkHeaders -TimeoutSec 30
         if ($resp.Product) {
@@ -248,6 +252,7 @@ function Get-DigiKeyPricing {
         # Non-2xx - try keyword search as a fallback (handles
         # "Duplicate Products found for X" 404s).
     }
+    Wait-ApiInterval -Api 'DigiKey'
     try {
         $kwBody = @{ Keywords = $MfrPn; Limit = 5; Offset = 0 } | ConvertTo-Json -Compress
         $kw = Invoke-RestMethod -Method Post -Uri "$dkEndpoint/products/v4/search/keyword" `
